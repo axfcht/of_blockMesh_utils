@@ -1,0 +1,102 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meshing-utils"
+version = "1.0.0"
+description = "Utilities for OpenFOAM blockMeshDict manipulation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "axfcht", email = "xeladude03@gmail.com"}]
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Typing :: Typed",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "numpy>=1.20",
+    "cadquery-ocp>=7.8,<7.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "pytest",
+    "pytest-timeout",
+]
+
+[project.urls]
+Homepage = "https://github.com/axfcht/of_blockMesh_utils"
+Repository = "https://github.com/axfcht/of_blockMesh_utils"
+Issues = "https://github.com/axfcht/of_blockMesh_utils/issues"
+
+[project.scripts]
+cleanBMD   = "meshing_utils.cli.clean_bmd:main"
+scaleBMD    = "meshing_utils.cli.scale_bmd:main"
+revolveBMD  = "meshing_utils.cli.revolve_bmd:main"
+extrudeBMD  = "meshing_utils.cli.extrude_surfaces:main"
+stpToBMD    = "meshing_utils.cli.stp_to_bmd:main"
+extractPatches = "meshing_utils.cli.extract_patches:main"
+extractCZones  = "meshing_utils.cli.extract_cell_zones:main"
+splitBMDZones  = "meshing_utils.cli.split_bmd_by_zones:main"
+combineBMD     = "meshing_utils.cli.combine_bmd:main"
+
+[tool.setuptools.package-data]
+"meshing_utils" = ["py.typed"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+timeout = 180
+timeout_method = "thread"
+markers = [
+    "integration: marks tests that require external files or OCC (deselect with '-m not integration')",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Package __init__.py files are intentional re-export facades: they import
+# symbols from submodules purely to keep them importable from the package
+# path. The curated public surface is the explicit __all__; the remaining
+# re-exports would otherwise trip F401 (unused import).
+"__init__.py" = ["F401"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src/meshing_utils"]
+warn_redundant_casts = true
+warn_unused_ignores = true
+check_untyped_defs = true
+
+# Lenient baseline for all modules in Phase 0.
+# Strict islands (foam, geometry, io) are re-enabled in Phase 5.1 once
+# __all__ is in place (Phase 1.2) and a dedicated typing pass is done.
+[[tool.mypy.overrides]]
+module = [
+    "meshing_utils.foam.*",
+    "meshing_utils.geometry.*",
+    "meshing_utils.io.*",
+    "meshing_utils.cad.*",
+    "meshing_utils.operations.*",
+]
+disallow_untyped_defs = false
+
+# Third-party without stubs
+[[tool.mypy.overrides]]
+module = ["OCP.*", "cadquery_ocp.*"]
+ignore_missing_imports = true

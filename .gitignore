@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Editors / IDEs
+.vscode/
+
+# Local AI assistant tooling and dev-only docs (not part of the released repo)
+.claude/
+.gemini/
+.github/skills/
+ARCHITECTURE.md
+CLAUDE.md
+DEVELOPMENT.md
+environment.yml
+
+# Local sample / scratch CAD and mesh inputs (test data lives in tests/fixtures/)
+blockMeshDicts/
+cad_files/
+vmap.json
