@@ -20,7 +20,6 @@ Before opening a pull request, please run the same checks as CI:
 
 ```bash
 ruff check src tests          # lint
-ruff format src tests         # format
 mypy src/meshing_utils        # type check
 pytest -m "not integration"   # tests
 ```
