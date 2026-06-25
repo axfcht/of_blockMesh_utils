@@ -298,16 +298,60 @@ class TestCombineCellZones:
 
 class TestVertexConflicts:
 
-    def test_vertex_name_coord_conflict_raises_valueerror(self):
-        """Vertex with same name but different coordinates always raises."""
+    def test_vertex_name_coord_conflict_renamed_on_new_coord(self):
+        """Vertex name collision with genuinely new coord: renamed v0 -> v0_2, no error."""
         bmd_a = BlockMeshDict()
         bmd_a.vertices.add(Vertex("v0", [0.0, 0.0, 0.0]))
+        # Give bmd_a a block that references v0 so we can verify remap in blocks
+        bmd_a.blocks.add(Block("block_a", vertices=["v0"] * 8, cells=[1, 1, 1]))
 
         bmd_b = BlockMeshDict()
         bmd_b.vertices.add(Vertex("v0", [99.0, 0.0, 0.0]))  # Different coords
+        bmd_b.blocks.add(Block("block_b", vertices=["v0"] * 8, cells=[1, 1, 1]))
 
-        with pytest.raises(ValueError, match="Vertex name conflict"):
-            combine_blockmeshdicts([bmd_a, bmd_b])
+        # Should NOT raise
+        combined = combine_blockmeshdicts([bmd_a, bmd_b])
+
+        vertex_names = [v.name for v in combined.vertices]
+        assert "v0" in vertex_names, "Original v0 must be present"
+        assert "v0_2" in vertex_names, "Renamed vertex v0_2 must be present"
+
+        # Coords map correctly
+        assert combined.vertices.get("v0").coords == [0.0, 0.0, 0.0]
+        assert combined.vertices.get("v0_2").coords == [99.0, 0.0, 0.0]
+
+        # The block from bmd_b must reference v0_2, not v0
+        block_b = combined.blocks.get("block_b")
+        assert "v0_2" in block_b.vertices, "block_b must reference renamed vertex v0_2"
+        assert "v0" not in block_b.vertices, "block_b must not reference original v0"
+
+    def test_vertex_name_collision_collapses_onto_existing_coord(self):
+        """Name collision where incoming coord matches an existing vertex under a different name."""
+        bmd_a = BlockMeshDict()
+        # vx at [5,5,5] and v0 at [0,0,0]
+        bmd_a.vertices.add(Vertex("vx", [5.0, 5.0, 5.0]))
+        bmd_a.vertices.add(Vertex("v0", [0.0, 0.0, 0.0]))
+        block_a_verts = ["v0", "vx", "v0", "vx", "v0", "vx", "v0", "vx"]
+        bmd_a.blocks.add(Block("block_a", vertices=block_a_verts, cells=[1, 1, 1]))
+
+        bmd_b = BlockMeshDict()
+        # v0 in bmd_b has coords [5,5,5] — same as bmd_a's vx, but name is v0
+        bmd_b.vertices.add(Vertex("v0", [5.0, 5.0, 5.0]))
+        bmd_b.blocks.add(Block("block_b", vertices=["v0"] * 8, cells=[1, 1, 1]))
+
+        combined = combine_blockmeshdicts([bmd_a, bmd_b])
+
+        vertex_names = [v.name for v in combined.vertices]
+        # No v0_2 should be added — it collapsed onto vx
+        assert "v0_2" not in vertex_names, "No renamed v0_2 expected (should collapse)"
+        assert vertex_names.count("v0") == 1, "v0 from bmd_a must still exist"
+        assert "vx" in vertex_names, "vx must still exist"
+
+        # block_b references should be remapped from v0 -> vx
+        block_b = combined.blocks.get("block_b")
+        assert all(n == "vx" for n in block_b.vertices), (
+            "block_b vertices must all reference 'vx' after collapse"
+        )
 
     def test_vertex_within_tol_is_ok(self):
         """Vertices within vertex_tol are treated as identical (no error)."""
@@ -322,6 +366,194 @@ class TestVertexConflicts:
         combined = combine_blockmeshdicts([bmd_a, bmd_b], vertex_tol=1e-9)
         vertex_names = [v.name for v in combined.vertices]
         assert vertex_names.count("v0") == 1
+
+
+class TestVertexRemapPropagation:
+    """Verify that vertex remap from _merge_vertices propagates to blocks, edges, and faces."""
+
+    def test_renamed_vertex_propagates_to_blocks(self):
+        """After vertex rename collision, merged block references the new name."""
+        bmd_a = BlockMeshDict()
+        _add_cube_block(bmd_a, "block_a", "va", x_offset=0.0)
+
+        bmd_b = BlockMeshDict()
+        # Reuse vertex name "va0" (same as bmd_a's va0) but with different coords
+        bmd_b.vertices.add(Vertex("va0", [100.0, 0.0, 0.0]))
+        v_names = ["va0"] + [f"vb{i}" for i in range(7)]
+        for i, c in enumerate(_cube_coords(x_offset=100.0)[1:], start=1):
+            bmd_b.vertices.add(Vertex(f"vb{i - 1}", list(c)))
+        bmd_b.blocks.add(Block("block_b", vertices=v_names, cells=[1, 1, 1]))
+
+        combined = combine_blockmeshdicts([bmd_a, bmd_b])
+
+        block_b = combined.blocks.get("block_b")
+        # va0 in bmd_b had a different coord -> renamed to va0_2
+        assert "va0_2" in block_b.vertices, "block_b should reference renamed vertex va0_2"
+        assert "va0" not in block_b.vertices, "block_b should not reference original va0"
+
+    def test_renamed_vertex_propagates_to_edges(self):
+        """After vertex rename collision, edge endpoints are remapped."""
+        bmd_a = BlockMeshDict()
+        bmd_a.vertices.add(Vertex("v0", [0.0, 0.0, 0.0]))
+        bmd_a.vertices.add(Vertex("v1", [1.0, 0.0, 0.0]))
+        bmd_a.edges.add(Edge("arc", "v0", "v1", coords=[0.5, 0.1, 0.0]))
+
+        bmd_b = BlockMeshDict()
+        # v0 in bmd_b at different coords -> will be renamed v0_2
+        bmd_b.vertices.add(Vertex("v0", [10.0, 0.0, 0.0]))
+        bmd_b.vertices.add(Vertex("v2", [11.0, 0.0, 0.0]))
+        # Edge from v0 (bmd_b) to v2 — should be remapped to v0_2 -> v2
+        bmd_b.edges.add(Edge("arc", "v0", "v2", coords=[10.5, 0.1, 0.0]))
+
+        combined = combine_blockmeshdicts([bmd_a, bmd_b])
+
+        edge_endpoints = {frozenset({e.v_start, e.v_end}) for e in combined.edges}
+        assert frozenset({"v0_2", "v2"}) in edge_endpoints, (
+            "Edge from bmd_b must use remapped endpoint v0_2"
+        )
+        # Original edge still present
+        assert frozenset({"v0", "v1"}) in edge_endpoints
+
+    def test_renamed_vertex_propagates_to_patches(self):
+        """After vertex rename collision, patch face vertices are remapped."""
+        bmd_a = BlockMeshDict()
+        bmd_a.vertices.add(Vertex("v0", [0.0, 0.0, 0.0]))
+        bmd_a.boundary.add(Patch("walls", type="wall", faces=[Face(["v0", "v1", "v2", "v3"])]))
+
+        bmd_b = BlockMeshDict()
+        # v0 in bmd_b at different coords -> renamed v0_2
+        bmd_b.vertices.add(Vertex("v0", [99.0, 0.0, 0.0]))
+        bmd_b.boundary.add(Patch("outlet", type="patch", faces=[Face(["v0", "v4", "v5", "v6"])]))
+
+        combined = combine_blockmeshdicts([bmd_a, bmd_b])
+
+        outlet_patch = None
+        for p in combined.boundary:
+            if p.name == "outlet":
+                outlet_patch = p
+                break
+        assert outlet_patch is not None
+        face_verts = outlet_patch.faces[0].vertices
+        assert "v0_2" in face_verts, "Face in outlet patch must use remapped v0_2"
+        assert "v0" not in face_verts, "Face in outlet patch must not reference original v0"
+
+    def test_sources_not_mutated_on_collision(self):
+        """Source BMD vertices/blocks/edges/faces are unchanged after a collision combine."""
+        bmd_a = BlockMeshDict()
+        bmd_a.vertices.add(Vertex("v0", [0.0, 0.0, 0.0]))
+        bmd_a.blocks.add(Block("block_a", vertices=["v0"] * 8, cells=[1, 1, 1]))
+
+        bmd_b = BlockMeshDict()
+        bmd_b.vertices.add(Vertex("v0", [99.0, 0.0, 0.0]))
+        bmd_b.blocks.add(Block("block_b", vertices=["v0"] * 8, cells=[1, 1, 1]))
+        bmd_b.edges.add(Edge("arc", "v0", "v1", coords=[0.5, 0.1, 0.0]))
+        bmd_b.boundary.add(Patch("walls", type="wall", faces=[Face(["v0", "v1", "v2", "v3"])]))
+
+        # Remember original state of bmd_b
+        first_v = next(iter(bmd_b.vertices))
+        orig_b_vertex_name = first_v.name
+        orig_b_vertex_coords = list(first_v.coords)
+        orig_b_block_verts = list(next(iter(bmd_b.blocks)).vertices)
+        orig_b_edge_start = next(iter(bmd_b.edges)).v_start
+        orig_b_face_verts = list(next(iter(bmd_b.boundary)).faces[0].vertices)
+
+        combine_blockmeshdicts([bmd_a, bmd_b])
+
+        # bmd_b must be completely unchanged
+        first_v_after = next(iter(bmd_b.vertices))
+        assert first_v_after.name == orig_b_vertex_name
+        assert first_v_after.coords == orig_b_vertex_coords
+        assert list(next(iter(bmd_b.blocks)).vertices) == orig_b_block_verts
+        assert next(iter(bmd_b.edges)).v_start == orig_b_edge_start
+        assert list(next(iter(bmd_b.boundary)).faces[0].vertices) == orig_b_face_verts
+
+
+    def test_collapsed_vertex_propagates_to_edges(self):
+        """COLLAPSE path: edge endpoints are remapped to the collapsed-onto name."""
+        bmd_a = BlockMeshDict()
+        # vx at [5,5,5] and v0 at [0,0,0]
+        bmd_a.vertices.add(Vertex("vx", [5.0, 5.0, 5.0]))
+        bmd_a.vertices.add(Vertex("v0", [0.0, 0.0, 0.0]))
+        # An edge in bmd_a from vx to v0
+        bmd_a.edges.add(Edge("arc", "vx", "v0", coords=[2.5, 2.5, 0.0]))
+
+        bmd_b = BlockMeshDict()
+        # v0 in bmd_b has coords [5,5,5] — same as bmd_a's vx (collapse R2)
+        bmd_b.vertices.add(Vertex("v0", [5.0, 5.0, 5.0]))
+        bmd_b.vertices.add(Vertex("vb1", [10.0, 0.0, 0.0]))
+        # Edge in bmd_b from v0 to vb1 — v0 must be remapped to vx
+        bmd_b.edges.add(Edge("arc", "v0", "vb1", coords=[7.5, 0.1, 0.0]))
+
+        combined = combine_blockmeshdicts([bmd_a, bmd_b])
+
+        edge_endpoints = {frozenset({e.v_start, e.v_end}) for e in combined.edges}
+        # bmd_b's edge endpoint v0 should be remapped to vx (the collapse target)
+        assert frozenset({"vx", "vb1"}) in edge_endpoints, (
+            "bmd_b edge must use collapsed-onto name 'vx', not 'v0'"
+        )
+        # No edge with the original v0 name for bmd_b's edge
+        assert frozenset({"v0", "vb1"}) not in edge_endpoints, (
+            "Edge must not reference original 'v0' after collapse"
+        )
+
+    def test_collapsed_vertex_propagates_to_patches(self):
+        """COLLAPSE path: patch face vertices are remapped to the collapsed-onto name."""
+        bmd_a = BlockMeshDict()
+        # vx at [5,5,5] and v0 at [0,0,0]
+        bmd_a.vertices.add(Vertex("vx", [5.0, 5.0, 5.0]))
+        bmd_a.vertices.add(Vertex("v0", [0.0, 0.0, 0.0]))
+        bmd_a.boundary.add(Patch("inlet", type="patch", faces=[Face(["v0", "v1", "v2", "v3"])]))
+
+        bmd_b = BlockMeshDict()
+        # v0 in bmd_b has coords [5,5,5] — same as bmd_a's vx (collapse R2)
+        bmd_b.vertices.add(Vertex("v0", [5.0, 5.0, 5.0]))
+        # Face in bmd_b references v0 (and unique vertices) — v0 must collapse to vx
+        bmd_b.boundary.add(Patch("outlet", type="patch", faces=[Face(["v0", "v4", "v5", "v6"])]))
+
+        combined = combine_blockmeshdicts([bmd_a, bmd_b])
+
+        outlet_patch = None
+        for p in combined.boundary:
+            if p.name == "outlet":
+                outlet_patch = p
+                break
+        assert outlet_patch is not None, "outlet patch must be present"
+        face_verts = outlet_patch.faces[0].vertices
+        assert "vx" in face_verts, (
+            "Face in outlet patch must reference collapsed-onto name 'vx'"
+        )
+        assert "v0" not in face_verts, (
+            "Face in outlet patch must not reference original 'v0' after collapse"
+        )
+
+    def test_resolve_vertex_name_falls_back_to_suffix_3(self):
+        """resolve_vertex_name: when v0_2 is already taken, the next name is v0_3."""
+        bmd_a = BlockMeshDict()
+        # Pre-occupy both v0 and v0_2 in bmd_a
+        bmd_a.vertices.add(Vertex("v0", [0.0, 0.0, 0.0]))
+        bmd_a.vertices.add(Vertex("v0_2", [1.0, 0.0, 0.0]))
+
+        bmd_b = BlockMeshDict()
+        # v0 in bmd_b: coords differ from v0 ([0,0,0]) AND from v0_2 ([1,0,0])
+        # and do not match any other existing vertex -> must be renamed v0_3
+        bmd_b.vertices.add(Vertex("v0", [99.0, 0.0, 0.0]))
+        bmd_b.blocks.add(Block("block_b", vertices=["v0"] * 8, cells=[1, 1, 1]))
+
+        combined = combine_blockmeshdicts([bmd_a, bmd_b])
+
+        vertex_names = [v.name for v in combined.vertices]
+        assert "v0_3" in vertex_names, (
+            "When v0_2 is already occupied, the renamed vertex must be v0_3"
+        )
+        assert combined.vertices.get("v0_3").coords == [99.0, 0.0, 0.0], (
+            "v0_3 must carry the new coordinates"
+        )
+
+        # block_b must reference v0_3, not v0 or v0_2
+        block_b = combined.blocks.get("block_b")
+        assert all(n == "v0_3" for n in block_b.vertices), (
+            "block_b must reference v0_3 after double suffix collision"
+        )
 
 
 class TestBlockNameConflicts:

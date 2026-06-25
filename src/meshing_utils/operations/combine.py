@@ -101,6 +101,23 @@ def _coord_distance(
     return math.sqrt(sum((ai - bi) ** 2 for ai, bi in zip(a, b, strict=False)))
 
 
+def resolve_vertex_name(out: BlockMeshDict, preferred: str) -> str:
+    """Return a vertex name not already present in *out*.
+
+    Mirrors resolve_block_name's "suffix" policy: returns *preferred*
+    when free, else preferred_2, preferred_3, ... Internal helper; not
+    part of the public API.
+    """
+    if preferred not in out.vertices:   # Vertices.__contains__(name)
+        return preferred
+    counter = 2
+    while True:
+        candidate = f"{preferred}_{counter}"
+        if candidate not in out.vertices:
+            return candidate
+        counter += 1
+
+
 def _merge_scalars(
     out: BlockMeshDict,
     src: BlockMeshDict,
@@ -180,14 +197,21 @@ def _merge_vertices(
     src: BlockMeshDict,
     label: str,
     vertex_tol: float,
-) -> None:
-    """Merge vertices from *src* into *out*.
+) -> dict[str, str]:
+    """Merge vertices from *src* into *out*, returning a name remap table.
 
-    Rules:
+    Rules (per incoming vertex ``v``):
 
-    - Same name, coordinate difference ≤ *vertex_tol* → skip (duplicate).
-    - Same name, coordinate difference > *vertex_tol* → ``ValueError`` (always).
-    - New name → deepcopy into output.
+    R4 — Same name, coordinate difference ≤ *vertex_tol* → identity remap,
+         skip add (duplicate).
+    R2 — Same name, coords differ, but the incoming coordinate matches an
+         existing vertex under a *different* name → collapse: remap to that
+         existing name, do not add.
+    R3 — Same name, coords differ, no coordinate match in output → unique
+         rename via ``resolve_vertex_name`` (``<name>_2``, ``_3``, ...);
+         add a deep copy with the new name.
+    R5 — New name → add deep copy as-is; identity remap entry so downstream
+         lookups never KeyError.
 
     Parameters
     ----------
@@ -198,25 +222,58 @@ def _merge_vertices(
     label:
         Human-readable label for diagnostic messages.
     vertex_tol:
-        Tolerance for coordinate conflict detection.
-    """
-    existing_names: dict[str, Vertex] = {v.name: v for v in out.vertices}
+        Tolerance for coordinate conflict detection (Euclidean distance).
 
+    Returns
+    -------
+    dict[str, str]
+        Mapping from every incoming vertex name to the name it resolves to
+        in the output.  Identity where unchanged.
+    """
+    existing_by_name: dict[str, Vertex] = {v.name: v for v in out.vertices}
+    remap: dict[str, str] = {}
     for v in src.vertices:
-        if v.name in existing_names:
-            existing_v = existing_names[v.name]
-            dist = _coord_distance(existing_v.coords, v.coords)
-            if dist > vertex_tol:
-                raise ValueError(
-                    f"[{label}] Vertex name conflict: vertex {v.name!r} already exists "
-                    f"with coordinates {existing_v.coords} but source has {v.coords} "
-                    f"(distance={dist:.3e}, tol={vertex_tol:.3e})."
+        if v.name in existing_by_name:
+            existing_v = existing_by_name[v.name]
+            if _coord_distance(existing_v.coords, v.coords) <= vertex_tol:
+                # Same name + same coords -> dedup (R4)
+                remap[v.name] = v.name
+                logger.debug("Skipping duplicate vertex %r from %s", v.name, label)
+                continue
+            # Name collision + differing coords:
+            # 1) does this coordinate already exist under a DIFFERENT name?
+            match = None
+            for ov in out.vertices:
+                if ov.name == v.name:
+                    continue
+                if _coord_distance(ov.coords, v.coords) <= vertex_tol:
+                    match = ov
+                    break
+            if match is not None:
+                # Collapse onto existing vertex (R2)
+                remap[v.name] = match.name
+                logger.info(
+                    "[%s] Vertex %r collapsed onto existing vertex %r (coords match within tol)",
+                    label, v.name, match.name,
                 )
-            # Duplicate (same name, same coords) → skip
-            logger.debug("Skipping duplicate vertex %r from %s", v.name, label)
+                continue
+            # 2) genuinely new coordinate -> unique rename (R3)
+            new_name = resolve_vertex_name(out, v.name)
+            new_v = copy.deepcopy(v)
+            new_v.name = new_name
+            out.vertices.add(new_v)
+            existing_by_name[new_name] = new_v
+            remap[v.name] = new_name
+            logger.info(
+                "[%s] Vertex name collision: %r renamed -> %r (coords differ)",
+                label, v.name, new_name,
+            )
         else:
-            out.vertices.add(copy.deepcopy(v))
-            existing_names[v.name] = v
+            new_v = copy.deepcopy(v)
+            out.vertices.add(new_v)
+            existing_by_name[v.name] = new_v
+            remap[v.name] = v.name   # identity (R5 uniformity)
+    return remap
 
 
 def _edges_equal(a: Edge, b: Edge) -> bool:
@@ -244,6 +301,7 @@ def _merge_edges(
     src: BlockMeshDict,
     label: str,
     strict: bool,
+    vertex_remap: dict[str, str],
 ) -> None:
     """Merge edges from *src* into *out*.
 
@@ -264,6 +322,9 @@ def _merge_edges(
         Human-readable label for diagnostic messages.
     strict:
         If ``True``, conflicts raise ``ValueError``.
+    vertex_remap:
+        Name remap table returned by ``_merge_vertices`` for this source.
+        Applied to edge endpoints before dedup/conflict detection.
     """
     # Build lookup: frozenset({v_start, v_end}) -> Edge
     existing_edges: dict[frozenset[str], Edge] = {}
@@ -272,25 +333,27 @@ def _merge_edges(
         existing_edges[key] = e
 
     for e in src.edges:
-        key = frozenset({e.v_start, e.v_end})
+        new_edge = copy.deepcopy(e)
+        new_edge.v_start = vertex_remap.get(new_edge.v_start, new_edge.v_start)
+        new_edge.v_end = vertex_remap.get(new_edge.v_end, new_edge.v_end)
+        key = frozenset({new_edge.v_start, new_edge.v_end})
         if key in existing_edges:
             existing = existing_edges[key]
-            if _edges_equal(existing, e):
+            if _edges_equal(existing, new_edge):
                 logger.debug(
                     "Skipping duplicate edge (%s, %s) from %s",
-                    e.v_start, e.v_end, label,
+                    new_edge.v_start, new_edge.v_end, label,
                 )
             else:
                 msg = (
-                    f"[{label}] Edge conflict at ({e.v_start}, {e.v_end}): "
-                    f"existing type={existing.type!r}, new type={e.type!r}. "
+                    f"[{label}] Edge conflict at ({new_edge.v_start}, {new_edge.v_end}): "
+                    f"existing type={existing.type!r}, new type={new_edge.type!r}. "
                     "Keeping existing edge."
                 )
                 if strict:
                     raise ValueError(msg)
                 logger.warning(msg)
         else:
-            new_edge = copy.deepcopy(e)
             out.edges.add(new_edge)
             existing_edges[key] = new_edge
 
@@ -300,11 +363,13 @@ def _merge_blocks(
     src: BlockMeshDict,
     label: str,
     combine_cell_zones: str | None,
+    vertex_remap: dict[str, str],
 ) -> None:
     """Merge blocks from *src* into *out*.
 
     Block name collisions are resolved via ``resolve_block_name`` (policy:
-    ``"suffix"``).  Vertex references stay as-is (vertex names are global).
+    ``"suffix"``).  Vertex references are remapped via *vertex_remap*
+    (collapse/rename from ``_merge_vertices``).
 
     When *combine_cell_zones* is not ``None``, every merged block's zone is
     overridden to that value (including blocks whose original zone was ``None``).
@@ -320,9 +385,13 @@ def _merge_blocks(
     combine_cell_zones:
         Zone name to assign to ALL merged blocks, or ``None`` to preserve
         each block's own zone.
+    vertex_remap:
+        Name remap table returned by ``_merge_vertices`` for this source.
+        Applied to block vertex references before adding to output.
     """
     for block in src.blocks:
         new_block = copy.deepcopy(block)
+        new_block.vertices = [vertex_remap.get(n, n) for n in new_block.vertices]
 
         # Resolve name collision
         resolved_name = resolve_block_name(out, new_block.name, policy="suffix")
@@ -345,6 +414,7 @@ def _merge_patches(
     src: BlockMeshDict,
     label: str,
     strict: bool,
+    vertex_remap: dict[str, str],
 ) -> None:
     """Merge patches and faces from *src* into *out*.
 
@@ -368,6 +438,9 @@ def _merge_patches(
         Human-readable label for diagnostic messages.
     strict:
         If ``True``, conflicts raise ``ValueError``.
+    vertex_remap:
+        Name remap table returned by ``_merge_vertices`` for this source.
+        Applied to face vertex lists before dedup/conflict detection.
     """
     # Build global face set across ALL output patches: face_key -> patch_name
     global_face_registry: dict[tuple[str, ...], str] = {}
@@ -388,18 +461,19 @@ def _merge_patches(
             # New patch — add it with all its faces (deduplicated against global set)
             new_patch = Patch(src_patch.name, type=src_patch.type, faces=[])
             for f in src_patch.faces:
-                fkey = tuple(sorted(f.vertices))
+                new_face = copy.deepcopy(f)
+                new_face.vertices = [vertex_remap.get(n, n) for n in new_face.vertices]
+                fkey = tuple(sorted(new_face.vertices))
                 if fkey in global_face_registry:
                     owner = global_face_registry[fkey]
                     msg = (
-                        f"[{label}] Face {list(f.vertices)} already present in patch "
+                        f"[{label}] Face {list(new_face.vertices)} already present in patch "
                         f"{owner!r}; skipping duplicate."
                     )
                     if strict:
                         raise ValueError(msg)
                     logger.warning(msg)
                 else:
-                    new_face = copy.deepcopy(f)
                     new_patch.faces.append(new_face)
                     global_face_registry[fkey] = new_patch.name
             out.boundary.add(new_patch)
@@ -421,17 +495,19 @@ def _merge_patches(
             }
 
             for f in src_patch.faces:
-                fkey = tuple(sorted(f.vertices))
+                new_face = copy.deepcopy(f)
+                new_face.vertices = [vertex_remap.get(n, n) for n in new_face.vertices]
+                fkey = tuple(sorted(new_face.vertices))
                 if fkey in patch_face_keys:
                     logger.debug(
                         "Skipping duplicate face %s in patch %r from %s",
-                        list(f.vertices), src_patch.name, label,
+                        list(new_face.vertices), src_patch.name, label,
                     )
                 elif fkey in global_face_registry:
                     # Face exists in a *different* patch — warn
                     owner = global_face_registry[fkey]
                     msg = (
-                        f"[{label}] Face {list(f.vertices)} is already present in "
+                        f"[{label}] Face {list(new_face.vertices)} is already present in "
                         f"patch {owner!r} (target patch: {src_patch.name!r}). "
                         "Skipping."
                     )
@@ -439,7 +515,6 @@ def _merge_patches(
                         raise ValueError(msg)
                     logger.warning(msg)
                 else:
-                    new_face = copy.deepcopy(f)
                     existing_patch.faces.append(new_face)
                     patch_face_keys.add(fkey)
                     global_face_registry[fkey] = existing_patch.name
@@ -485,8 +560,17 @@ def combine_blockmeshdicts(
     ------
     ValueError
         When *sources* is empty, or when an unresolvable conflict is
-        detected (e.g. vertex coordinate mismatch, or any conflict when
-        *strict* is ``True``).
+        detected (e.g. any conflict when *strict* is ``True``).
+
+    Notes
+    -----
+    Vertex name collisions with differing coordinates are handled
+    gracefully: if the incoming coordinate already exists in the output
+    under a *different* name the incoming vertex is collapsed onto that
+    name (no duplicate added); otherwise the vertex is added under a
+    unique name generated by the ``<name>_2``, ``<name>_3``, ... suffix
+    scheme.  Downstream references (blocks, edges, faces) are updated
+    via the per-source remap table produced by ``_merge_vertices``.
     """
     if not sources:
         raise ValueError(
@@ -545,10 +629,10 @@ def combine_blockmeshdicts(
             len(list(src.boundary)),
         )
         _merge_scalars(out, src, label, strict)
-        _merge_vertices(out, src, label, vertex_tol)
-        _merge_edges(out, src, label, strict)
-        _merge_blocks(out, src, label, combine_cell_zones)
-        _merge_patches(out, src, label, strict)
+        vertex_remap = _merge_vertices(out, src, label, vertex_tol)
+        _merge_edges(out, src, label, strict, vertex_remap)
+        _merge_blocks(out, src, label, combine_cell_zones, vertex_remap)
+        _merge_patches(out, src, label, strict, vertex_remap)
 
     logger.info(
         "Combined result: %d vertex(ices), %d block(s), %d edge(s), %d patch(es)",

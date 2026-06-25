@@ -123,7 +123,10 @@ def main(argv: list[str] | None = None) -> int:
         metavar="FLOAT",
         help=(
             "Tolerance for vertex coordinate conflict detection (Euclidean "
-            "distance).  Default: 1e-9."
+            "distance). Used to detect and handle vertex name collisions: "
+            "same name + same coords → deduplicated; same name + differing "
+            "coords → collapsed onto existing matching coordinate or renamed "
+            "with numeric suffix (_2, _3, ...).  Default: 1e-9."
         ),
     )
     parser.add_argument(

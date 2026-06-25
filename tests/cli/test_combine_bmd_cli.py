@@ -200,6 +200,160 @@ def test_cli_backup_created_when_output_exists(case_dir: Path):
 # ---------------------------------------------------------------------------
 
 
+_BMD_COLLISION_A = """\
+/*--------------------------------*- C++ -*----------------------------------*\\
+  =========                 |
+  \\\\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\\\    /   O peration     | Website:  https://openfoam.org
+    \\\\  /    A nd           | Version:  13
+     \\/     M anipulation  |
+\\*---------------------------------------------------------------------------*/
+FoamFile
+{
+\tformat      ascii;
+\tclass       dictionary;
+\tobject      blockMeshDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+convertToMeters 1;
+
+geometry
+{
+}
+
+vertices
+(
+\tname v0 (0.00000000 0.00000000 0.00000000)
+\tname v1 (1.00000000 0.00000000 0.00000000)
+\tname v2 (1.00000000 1.00000000 0.00000000)
+\tname v3 (0.00000000 1.00000000 0.00000000)
+\tname v4 (0.00000000 0.00000000 1.00000000)
+\tname v5 (1.00000000 0.00000000 1.00000000)
+\tname v6 (1.00000000 1.00000000 1.00000000)
+\tname v7 (0.00000000 1.00000000 1.00000000)
+);
+
+edges
+(
+);
+
+blocks
+(
+\thex (v0 v1 v2 v3 v4 v5 v6 v7) zoneA (1 1 1) simpleGrading (1 1 1)
+);
+
+defaultPatch
+{
+\tname defaultFaces;
+\ttype empty;
+}
+
+boundary
+(
+);
+
+// ************************************************************************* //
+"""
+
+_BMD_COLLISION_B = """\
+/*--------------------------------*- C++ -*----------------------------------*\\
+  =========                 |
+  \\\\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\\\    /   O peration     | Website:  https://openfoam.org
+    \\\\  /    A nd           | Version:  13
+     \\/     M anipulation  |
+\\*---------------------------------------------------------------------------*/
+FoamFile
+{
+\tformat      ascii;
+\tclass       dictionary;
+\tobject      blockMeshDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+convertToMeters 1;
+
+geometry
+{
+}
+
+vertices
+(
+\tname v0 (10.00000000 0.00000000 0.00000000)
+\tname vb1 (11.00000000 0.00000000 0.00000000)
+\tname vb2 (11.00000000 1.00000000 0.00000000)
+\tname vb3 (10.00000000 1.00000000 0.00000000)
+\tname vb4 (10.00000000 0.00000000 1.00000000)
+\tname vb5 (11.00000000 0.00000000 1.00000000)
+\tname vb6 (11.00000000 1.00000000 1.00000000)
+\tname vb7 (10.00000000 1.00000000 1.00000000)
+);
+
+edges
+(
+);
+
+blocks
+(
+\thex (v0 vb1 vb2 vb3 vb4 vb5 vb6 vb7) zoneB (1 1 1) simpleGrading (1 1 1)
+);
+
+defaultPatch
+{
+\tname defaultFaces;
+\ttype empty;
+}
+
+boundary
+(
+);
+
+// ************************************************************************* //
+"""
+
+
+@pytest.fixture()
+def collision_case_dir(tmp_path: Path) -> Path:
+    """Write two fragment files that share vertex name v0 with DIFFERENT coordinates."""
+    system_dir = tmp_path / "system"
+    system_dir.mkdir()
+    (system_dir / "blockMeshDict_collision_a").write_text(_BMD_COLLISION_A, encoding="utf-8")
+    (system_dir / "blockMeshDict_collision_b").write_text(_BMD_COLLISION_B, encoding="utf-8")
+    return tmp_path
+
+
+def test_cli_vertex_name_collision_different_coords_renamed(collision_case_dir: Path):
+    """CLI: same vertex name with different coords does not raise; v0_2 is present in output."""
+    exit_code = main([
+        "--caseDir", str(collision_case_dir),
+        "--noBackup",
+    ])
+    assert exit_code == 0, "combineBMD should succeed even with vertex name collision"
+
+    output_path = collision_case_dir / "system" / "blockMeshDict"
+    assert output_path.is_file(), "Output blockMeshDict was not written."
+
+    combined = BlockMeshDict(output_path)
+
+    vertex_names = [v.name for v in combined.vertices]
+    assert "v0" in vertex_names, "Original v0 must be present"
+    assert "v0_2" in vertex_names, "Renamed v0_2 must be present in output"
+
+    # Both blocks must be present (2 blocks total)
+    assert len(combined.blocks) == 2
+
+    # The block from collision_b must reference v0_2
+    zones = {b.zone for b in combined.blocks}
+    assert "zoneA" in zones
+    assert "zoneB" in zones
+
+    # Find the zoneB block and confirm it references v0_2
+    zone_b_block = next(b for b in combined.blocks if b.zone == "zoneB")
+    assert "v0_2" in zone_b_block.vertices, "zoneB block must reference renamed vertex v0_2"
+    assert "v0" not in zone_b_block.vertices, "zoneB block must not reference original v0"
+
+
 def test_cli_no_backup_suppresses_backup(case_dir: Path):
     """--noBackup prevents creation of a .bak file."""
     system_dir = case_dir / "system"
