@@ -9,6 +9,10 @@ from meshing_utils.geometry.hex_topology import CurveInfo
 
 logger = logging.getLogger(__name__)
 
+# A single OpenFOAM arc midpoint uniquely defines an arc for any span < 360 deg.
+# Only spans within this epsilon of a full turn are ambiguous and fall back to BSpline.
+ARC_FULL_TURN_EPS = 1e-6  # radians
+
 
 def classify_edge(topo_edge, n_samples: int = 20) -> CurveInfo:
     """Classify a topological edge and return a ``CurveInfo``.
@@ -38,7 +42,7 @@ def classify_edge(topo_edge, n_samples: int = 20) -> CurveInfo:
 
     if curve_type == GeomAbs_Circle:
         arc_angle = abs(u_last - u_first)
-        if arc_angle <= math.pi / 2:
+        if arc_angle < 2.0 * math.pi - ARC_FULL_TURN_EPS:
             u_mid = (u_first + u_last) / 2.0
             pnt = adaptor.Value(u_mid)
             midpoint = (pnt.X(), pnt.Y(), pnt.Z())
@@ -50,7 +54,8 @@ def classify_edge(topo_edge, n_samples: int = 20) -> CurveInfo:
             )
         else:
             logger.warning(
-                "Arc edge has angle %.3f rad > pi/2; falling back to bspline sampling.",
+                "Circular arc span %.6f rad is within epsilon of a full turn; "
+                "a single arc midpoint is ambiguous, falling back to bspline sampling.",
                 arc_angle,
             )
             inner = _sample_inner_points(adaptor, u_first, u_last, n_samples)

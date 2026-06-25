@@ -123,7 +123,17 @@ def _solid_to_hex_candidate(solid, label: str | None, pool: PointPool) -> HexCan
                     if curve_info.kind != "line":
                         edge_curves[key] = curve_info
                 except Exception:
-                    pass
+                    # A single malformed edge must not abort the whole STEP
+                    # load, but the failure must be visible: the edge is
+                    # silently downgraded to a straight line, which can
+                    # distort the resulting mesh.
+                    logger.warning(
+                        "Failed to classify edge between vertices %d and %d; "
+                        "treating it as a straight line.",
+                        idx_first,
+                        idx_last,
+                        exc_info=True,
+                    )
 
             if not face_verts:
                 face_verts.append(idx_first)

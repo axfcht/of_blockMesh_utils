@@ -519,22 +519,100 @@ class TestClassifyEdge:
             assert first != pytest.approx((0.0, 0.0, 0.0), abs=1e-6)
             assert last != pytest.approx((1.0, 0.0, 0.0), abs=1e-6)
 
-    def test_arc_over_half_pi_becomes_bspline(self, caplog):
+    def test_arc_over_half_pi_becomes_arc(self):
+        import math
+
         from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
         from OCP.Geom import Geom_Circle
         from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
 
         ax = gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1))
         circle = Geom_Circle(ax, 1.0)
-        import math
         edge = BRepBuilderAPI_MakeEdge(circle, 0.0, math.radians(200)).Edge()
+
+        curve_info = stp_mod.classify_edge(edge, n_samples=10)
+
+        assert curve_info.kind == "arc"
+        assert curve_info.arc_midpoint is not None
+        assert curve_info.arc_midpoint == pytest.approx(
+            (math.cos(math.radians(100)), math.sin(math.radians(100)), 0.0), abs=1e-6
+        )
+
+    def test_arc_between_half_pi_and_pi_becomes_arc(self):
+        """Regression: arcs in the (pi/2, pi] range must classify as arc, not bspline."""
+        import math
+
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+        from OCP.Geom import Geom_Circle
+        from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+        ax = gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1))
+        circle = Geom_Circle(ax, 1.0)
+        edge = BRepBuilderAPI_MakeEdge(circle, 0.0, math.radians(120)).Edge()
+
+        curve_info = stp_mod.classify_edge(edge, n_samples=10)
+
+        assert curve_info.kind == "arc"
+
+    def test_arc_just_under_full_turn_becomes_arc(self):
+        """A 359-degree arc is not a full circle and must classify as arc."""
+        import math
+
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+        from OCP.Geom import Geom_Circle
+        from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+        ax = gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1))
+        circle = Geom_Circle(ax, 1.0)
+        edge = BRepBuilderAPI_MakeEdge(circle, 0.0, math.radians(359)).Edge()
+
+        curve_info = stp_mod.classify_edge(edge, n_samples=10)
+
+        assert curve_info.kind == "arc"
+        assert curve_info.arc_midpoint is not None
+
+    def test_full_circle_becomes_bspline(self, caplog):
+        """A full-turn circular edge (span = 2*pi) must fall back to bspline sampling."""
+        import math
+
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+        from OCP.Geom import Geom_Circle
+        from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+        ax = gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1))
+        circle = Geom_Circle(ax, 1.0)
+        edge = BRepBuilderAPI_MakeEdge(circle, 0.0, 2 * math.pi).Edge()
 
         with caplog.at_level(logging.WARNING):
             curve_info = stp_mod.classify_edge(edge, n_samples=10)
 
         assert curve_info.kind == "bspline"
-        assert any("arc" in r.message.lower() or "warn" in r.message.lower()
-                   for r in caplog.records)
+        assert any(
+            "full turn" in r.message.lower() or "bspline" in r.message.lower()
+            for r in caplog.records
+        ), "Expected a warning about the near-full-turn fallback to bspline"
+
+    def test_arc_near_full_turn_epsilon_boundary(self):
+        """Lock down the ARC_FULL_TURN_EPS (1e-6) boundary: spans within epsilon
+        of a full turn fall back to bspline; spans clearly below stay arc."""
+        import math
+
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+        from OCP.Geom import Geom_Circle
+        from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+        ax = gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1))
+        circle = Geom_Circle(ax, 1.0)
+
+        # Within epsilon of a full turn -> bspline
+        span_within = 2 * math.pi - 1e-7
+        edge_within = BRepBuilderAPI_MakeEdge(circle, 0.0, span_within).Edge()
+        assert stp_mod.classify_edge(edge_within, n_samples=10).kind == "bspline"
+
+        # Clearly below the threshold -> arc
+        span_below = 2 * math.pi - 1e-3
+        edge_below = BRepBuilderAPI_MakeEdge(circle, 0.0, span_below).Edge()
+        assert stp_mod.classify_edge(edge_below, n_samples=10).kind == "arc"
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +686,53 @@ class TestIsHexTopology:
         assert exp.More()
         solid = TopoDS.Solid_s(exp.Current())
         assert not stp_mod._is_hex_topology(solid)
+
+
+@requires_ocp
+class TestSolidToHexCandidateErrorHandling:
+    def test_classify_edge_failure_is_logged_not_swallowed(
+        self, caplog, monkeypatch
+    ):
+        """A classify_edge exception must not abort the load and must be logged.
+
+        Previously the failure was silently swallowed (``except Exception:
+        pass``), turning a curved edge into a straight line with no trace. The
+        topology must still be extracted, but a warning must be emitted.
+        """
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+        from OCP.TopAbs import TopAbs_SOLID
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopoDS import TopoDS
+
+        from meshing_utils.geometry.hex_topology import PointPool
+        from meshing_utils.operations.stp_pipeline import loading
+
+        box = BRepPrimAPI_MakeBox(1.0, 1.0, 1.0).Shape()
+        exp = TopExp_Explorer(box, TopAbs_SOLID)
+        assert exp.More()
+        solid = TopoDS.Solid_s(exp.Current())
+
+        def _raise(*_args, **_kwargs):
+            raise RuntimeError("synthetic classification failure")
+
+        # loading.py calls its module-global ``classify_edge``, so patch there.
+        monkeypatch.setattr(loading, "classify_edge", _raise)
+
+        pool = PointPool(tol=1e-6)
+        with caplog.at_level(logging.WARNING):
+            candidate = loading._solid_to_hex_candidate(solid, "box", pool)
+
+        # The load must not crash; topology is still fully extracted.
+        assert len(candidate.vertex_indices) == 8
+        assert len(candidate.edges) == 12
+        assert len(candidate.faces) == 6
+        # Every edge failed classification, so no curved edges are recorded...
+        assert candidate.edge_curves == {}
+        # ...but the failure must be visible, not swallowed.
+        assert any(
+            r.levelno == logging.WARNING and "classify edge" in r.message.lower()
+            for r in caplog.records
+        )
 
 
 @requires_ocp
